@@ -59,6 +59,22 @@ pub trait FromIterator<A>: Sized {
     /// This method fills an array using the given iterator. If there aren't
     /// enough items available, it will return a [FromIteratorError].
     fn try_from_iter<T: IntoIterator<Item = A>>(iter: T) -> Result<Self, FromIteratorError>;
+
+    /// This method fills an array using the given iterator. Note that it
+    /// will panic if the iterator doesn't contain enough items, or there are more elements than
+    /// expected.
+    fn from_iter_exact<T: IntoIterator<Item = A>>(iter: T) -> Self;
+
+    /// This method fills an array using the given iterator.
+    ///
+    /// - If there aren't enough items available,it will return [FromIteratorExactError::NotEnoughElement].
+    /// - If there are more elements than expected, it will return [FromIteratorExactError::TooManyElements].
+    ///   This variant contains the last value returned from the given iterator,
+    ///   since we consume the excessive element from the iterator (if any)
+    ///   in order to check if the length matches.
+    fn try_from_iter_exact<T: IntoIterator<Item = A>>(
+        iter: T,
+    ) -> Result<Self, FromIteratorExactError<A>>;
 }
 
 /// This represents the error when there aren't enough items available to fill the
@@ -72,6 +88,27 @@ impl fmt::Display for FromIteratorError {
     }
 }
 
+/// This represents the error when there aren't enough items available to fill the
+/// entire array, or there are more elements than expected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FromIteratorExactError<T> {
+    NotEnoughElement,
+    TooManyElements(T),
+}
+
+impl<T> fmt::Display for FromIteratorExactError<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FromIteratorExactError::NotEnoughElement => {
+                write!(f, "iterator exhausted unexpectedly")
+            }
+            FromIteratorExactError::TooManyElements(_) => {
+                write!(f, "iterator has more elements than expected")
+            }
+        }
+    }
+}
+
 impl error::Error for FromIteratorError {}
 
 impl<A, const N: usize> FromIterator<A> for [A; N] {
@@ -80,36 +117,66 @@ impl<A, const N: usize> FromIterator<A> for [A; N] {
     }
 
     fn try_from_iter<T: IntoIterator<Item = A>>(iter: T) -> Result<Self, FromIteratorError> {
-        let mut iterator = iter.into_iter();
-
-        // use [MaybeUninit::uninit_array] when that method stabilizes
-        let mut array: [mem::MaybeUninit<A>; N] = unsafe {
-            // This `assume_init` call is safe because we are initialising
-            // a bunch of `MaybeUninit`s, which do not require initialisation.
-            mem::MaybeUninit::uninit().assume_init()
-        };
-
-        for elem in &mut array[..] {
-            // now fill the array using the iterator
-            *elem = mem::MaybeUninit::new(iterator.next().ok_or(FromIteratorError)?);
-        }
-
-        let array_ptr = &array as *const _ as *const [A; N];
-
-        // use [MaybeUninit::array_assume_init] when that method stabilizes
-        Ok(unsafe {
-            // This requires the pointer to be valid, properly aligned, and correctly
-            // initialised. It would be better to use [std::mem::transmute] here,
-            // but that is not possible because the types depend on the const
-            // parameter `N`.
-            array_ptr.read()
-        })
+        try_from_iter_impl(iter, false).map_err(|_| FromIteratorError)
     }
+
+    fn from_iter_exact<T: IntoIterator<Item = A>>(iter: T) -> Self {
+        use FromIteratorExactError::*;
+        match Self::try_from_iter_exact(iter) {
+            Ok(ret) => ret,
+            Err(NotEnoughElement) => panic!("iterator exhausted unexpectedly"),
+            Err(TooManyElements(_)) => panic!("iterator has more elements than expected"),
+        }
+    }
+
+    fn try_from_iter_exact<T: IntoIterator<Item = A>>(
+        iter: T,
+    ) -> Result<Self, FromIteratorExactError<A>> {
+        try_from_iter_impl(iter, true)
+    }
+}
+
+fn try_from_iter_impl<A, T: IntoIterator<Item = A>, const N: usize>(
+    iter: T,
+    check_next: bool,
+) -> Result<[A; N], FromIteratorExactError<A>> {
+    use FromIteratorExactError::*;
+
+    let mut iterator = iter.into_iter();
+
+    // use [MaybeUninit::uninit_array] when that method stabilizes
+    let mut array: [mem::MaybeUninit<A>; N] = unsafe {
+        // This `assume_init` call is safe because we are initialising
+        // a bunch of `MaybeUninit`s, which do not require initialisation.
+        mem::MaybeUninit::uninit().assume_init()
+    };
+
+    for elem in &mut array[..] {
+        // now fill the array using the iterator
+        *elem = mem::MaybeUninit::new(iterator.next().ok_or(NotEnoughElement)?);
+    }
+
+    if check_next {
+        if let Some(next) = iterator.next() {
+            return Err(TooManyElements(next));
+        }
+    }
+
+    let array_ptr = &array as *const _ as *const [A; N];
+
+    // use [MaybeUninit::array_assume_init] when that method stabilizes
+    Ok(unsafe {
+        // This requires the pointer to be valid, properly aligned, and correctly
+        // initialised. It would be better to use [std::mem::transmute] here,
+        // but that is not possible because the types depend on the const
+        // parameter `N`.
+        array_ptr.read()
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::FromIterator;
+    use super::{FromIterator, FromIteratorExactError::*};
 
     #[test]
     fn it_works() {
@@ -137,5 +204,31 @@ mod tests {
     #[test]
     fn try_from_iter_error() {
         <[i32; 1000]>::try_from_iter(std::iter::once(5)).unwrap_err();
+    }
+
+    #[test]
+    fn test_from_iter_exact() {
+        assert_eq!(
+            <[i32; 6]>::from_iter_exact((0..6).map(|i| i * 2)),
+            [0, 2, 4, 6, 8, 10]
+        );
+    }
+
+    #[test]
+    fn test_try_from_iter_exact() {
+        assert_eq!(
+            <[i32; 6]>::try_from_iter_exact((0..6).map(|i| i * 2)),
+            Ok([0, 2, 4, 6, 8, 10])
+        );
+        assert_eq!(
+            <[i32; 6]>::try_from_iter_exact((0..5).map(|i| i * 2)),
+            Err(NotEnoughElement)
+        );
+        let mut even_numbers = (0..).map(|i| i * 2);
+        assert_eq!(
+            <[i32; 6]>::try_from_iter_exact(&mut even_numbers),
+            Err(TooManyElements(12))
+        );
+        assert_eq!(even_numbers.next(), Some(14));
     }
 }
